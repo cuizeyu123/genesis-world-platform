@@ -54,8 +54,10 @@ from pydantic import BaseModel, Field
 import uvicorn
 if __package__:
     from .teleop_recording import create_recording_session
+    from .teleop_validation import validate_agent_plan, validate_move_delta
 else:
     from teleop_recording import create_recording_session
+    from teleop_validation import validate_agent_plan, validate_move_delta
 import genesis as gs
 from genesis.utils.geom import inv_T, pos_lookat_up_to_T, trans_quat_to_T, transform_quat_by_quat
 from genesis.utils.misc import tensor_to_array
@@ -1056,11 +1058,7 @@ class FrankaTeleopPlatform:
             if action not in ("move", "open_gripper", "close_gripper"):
                 raise ValueError("不支持的 VLM 动作")
             if action == "move":
-                delta = np.asarray((params or {}).get("delta_m", []), dtype=np.float64)
-                if delta.shape != (3,) or not np.all(np.isfinite(delta)):
-                    raise ValueError("VLM 移动量格式无效")
-                if np.max(np.abs(delta)) > AGENT_MOVE_MAX_M + 1e-9 or np.linalg.norm(delta) > 0.04:
-                    raise ValueError("VLM 移动量超过单步安全范围，请重新分析")
+                delta = validate_move_delta((params or {}).get("delta_m", []))
                 ee = np.asarray(state.get("ee") or [], dtype=np.float64)
                 target = ee + delta if ee.shape == (3,) else np.full(3, np.nan)
                 if not np.all(np.isfinite(target)) or np.any(target < WORKSPACE_LOW) or np.any(target > WORKSPACE_HIGH):
@@ -1531,18 +1529,10 @@ def create_app(platform: FrankaTeleopPlatform) -> FastAPI:
                 ) from exc
             raise HTTPException(status_code=502, detail=f"VLM 返回内容无效：{type(exc).__name__}") from exc
 
-        if plan.delta_m and (
-            len(plan.delta_m) != 3 or not np.all(np.isfinite(np.asarray(plan.delta_m, dtype=np.float64)))
-        ):
-            raise HTTPException(status_code=502, detail="VLM 位移建议包含无效数值，请重新分析")
-        if plan.action == "move":
-            delta = np.asarray(plan.delta_m, dtype=np.float64)
-            if delta.shape != (3,) or not np.all(np.isfinite(delta)):
-                raise HTTPException(status_code=502, detail="VLM 移动建议格式无效，请重新分析")
-            if np.max(np.abs(delta)) > AGENT_MOVE_MAX_M + 1e-9 or np.linalg.norm(delta) > 0.04:
-                raise HTTPException(status_code=502, detail="VLM 给出的移动建议超出单步限幅，请重新分析")
-        elif plan.delta_m and any(abs(float(value)) > 1e-9 for value in plan.delta_m):
-            raise HTTPException(status_code=502, detail="非移动动作不应包含末端位移")
+        try:
+            validate_agent_plan(plan.action, plan.delta_m)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         LOGGER.info(
             "VLM scene analysis completed: model=%s elapsed_s=%.2f action=%s target=%s confidence=%.2f",
             VLM_MODEL,
