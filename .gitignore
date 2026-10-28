@@ -160,3 +160,7 @@ outputs/
 
 # Local benchmark archive (not versioned)
 /benchmarks/
+
+# JavaScript dependencies and generated frontend bundles
+**/node_modules/
+examples/teleop/web/dist/

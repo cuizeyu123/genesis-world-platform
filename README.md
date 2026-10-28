@@ -95,6 +95,8 @@ Genesis exposes three rendering paths as camera sensors: built-in (Nyx / Luisa /
 | [Batched IK](./examples/tutorials/batched_IK.py) | [Drone](./examples/drone/hover_train.py) | [Advanced: worm](./examples/tutorials/advanced_worm.py) |
 | <img src="https://raw.githubusercontent.com/Genesis-Embodied-AI/genesis-world/readme-assets/videos/tutorials_batched_IK.webp" width="240"> | <img src="https://raw.githubusercontent.com/Genesis-Embodied-AI/genesis-world/readme-assets/videos/drone_hover_train.webp" width="240"> | <img src="https://raw.githubusercontent.com/Genesis-Embodied-AI/genesis-world/readme-assets/videos/tutorials_advanced_worm.webp" width="240"> |
 
+The [browser teleoperation workbench](./examples/teleop/README.md) streams a live Genesis camera view and supports Cartesian or seven-joint control of a simulated Franka Panda.
+
 ## Quick Installation
 
 ### Using pip
