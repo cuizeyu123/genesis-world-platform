@@ -13,6 +13,12 @@
 
 </div>
 
+<div align="center">
+<video src="https://github.com/cuizeyu123/genesis-world-platform/raw/refs/heads/main/examples/teleop/assets/teleop-demo.mp4" controls playsinline preload="metadata" width="100%">
+  <a href="examples/teleop/assets/teleop-demo.mp4">播放工作台演示视频</a>
+</video>
+</div>
+
 这是一个基于 [Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world) 的实时仿真遥控项目。它把 Genesis 中的 Franka Panda 仿真、相机和安全检查接入浏览器工作台，支持手动遥控、固定程序化抓取、可选 VLM 视觉任务，以及 MP4、MCAP 和 LeRobot 数据录制。
 
 > 当前版本运行在 Genesis 仿真中，不连接真实机械臂。碰撞检测和零力模式是仿真功能，不构成硬件安全认证。
