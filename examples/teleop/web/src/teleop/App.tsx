@@ -16,6 +16,7 @@ type AgentPlan = {
   confidence: number;
 };
 type AgentStatus = { configured: boolean; model: string; max_move_m: number };
+type ProgramStatus = { program: string; label: string; state: "idle" | "queued" | "running" | "completed" | "failed" | "stopped"; step: number; total: number; message: string };
 type TeleopState = {
   ee: number[];
   quat: number[];
@@ -42,6 +43,7 @@ type TeleopState = {
   sensor_mode: SensorMode;
   objects?: { name: string; color: string; position: number[] }[];
   agent_busy?: boolean;
+  program_status?: ProgramStatus;
   error?: string;
 };
 type Command = {
@@ -102,6 +104,8 @@ function App() {
   const [agentLoading, setAgentLoading] = useState(false);
   const [agentAutoRunning, setAgentAutoRunning] = useState(false);
   const [agentError, setAgentError] = useState("");
+  const [programSubmitting, setProgramSubmitting] = useState(false);
+  const [programError, setProgramError] = useState("");
   const [toast, setToast] = useState("");
   const [clock, setClock] = useState(() => new Date().toLocaleTimeString("zh-CN", { hour12: false }));
   const [rtt, setRtt] = useState<number | null>(null);
@@ -111,6 +115,7 @@ function App() {
   const latestJoints = useRef<number[] | null>(null);
   const agentStopRequested = useRef(false);
   const agentAnalyzeController = useRef<AbortController | null>(null);
+  const lastProgramStatus = useRef<ProgramStatus | null>(null);
   const viewDrag = useRef<{ pointerId: number; x: number; y: number; height: number; mode: "orbit" | "pan" } | null>(null);
 
   useEffect(() => {
@@ -156,15 +161,16 @@ function App() {
         const response = await fetch("/api/health", { cache: "no-store" });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const health = await response.json() as {
-          features?: { smooth_home?: boolean; first_person_modes?: string[]; collision_zero_force?: boolean; recording_formats?: RecordingFormat[] };
+          features?: { smooth_home?: boolean; first_person_modes?: string[]; collision_zero_force?: boolean; recording_formats?: RecordingFormat[]; natural_programs?: boolean };
         };
         const features = health.features;
         setAvailableRecordingFormats(features?.recording_formats ?? ["mp4"]);
         const current = !!features?.smooth_home
           && !!features?.collision_zero_force
+          && !!features?.natural_programs
           && ["rgb", "depth", "pointcloud", "segmentation"].every((mode) => features.first_person_modes?.includes(mode));
         if (active) {
-          setBackendCompatibilityError(current ? "" : "当前遥控后端版本较旧。请关闭正在运行的遥控服务，再从当前项目重新启动 teleop_platform.py；否则回零仍会瞬间跳转，第一视角接口也不可用。");
+          setBackendCompatibilityError(current ? "" : "当前遥控后端版本较旧。请关闭正在运行的遥控服务，再从当前项目重新启动 teleop_platform.py，以启用当前工作台功能。");
         }
       } catch {
         if (active) setBackendCompatibilityError("");
@@ -209,6 +215,13 @@ function App() {
         if (!active) return;
         setOnline(true);
         setTeleopState(next);
+        const previousProgram = lastProgramStatus.current;
+        const currentProgram = next.program_status;
+        if (previousProgram && ["queued", "running"].includes(previousProgram.state) && currentProgram && ["completed", "failed", "stopped"].includes(currentProgram.state)) {
+          setGripper(next.gripper);
+          commandRef.current = { ...commandRef.current, gripper: next.gripper };
+        }
+        lastProgramStatus.current = currentProgram ?? null;
         if (next.sensor_mode) setSensorMode(next.sensor_mode);
         if (next.joints?.length === 7) {
           latestJoints.current = next.joints;
@@ -267,6 +280,7 @@ function App() {
 
   const jointLimits = teleopState?.joint_limits;
   const activeKeys = useMemo(() => new Set(keys), [keys]);
+  const programBusy = teleopState?.program_status?.state === "queued" || teleopState?.program_status?.state === "running";
 
   const toggleControl = () => {
     const next = !enabled;
@@ -386,7 +400,40 @@ function App() {
     } catch (error) {
       console.error("[teleop] VLM stop request failed", error);
     }
-    notify("已请求停止 VLM 任务");
+    notify("已请求停止当前自然语言任务");
+  };
+
+  const runNaturalProgram = async () => {
+    const task = agentTask.trim();
+    if (!task || programSubmitting || !enabled || collisionMode || teleopState?.agent_busy || keys.length) return;
+    setProgramSubmitting(true);
+    setProgramError("");
+    setAgentPlan(null);
+    try {
+      const programCommand = { ...commandRef.current, mode: "cartesian" as const, keys: [] };
+      commandRef.current = programCommand;
+      setMode("cartesian");
+      const commandResponse = await fetch("/api/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(programCommand),
+      });
+      if (!commandResponse.ok) throw new Error("工作台控制状态更新失败，请重试");
+      const response = await fetch("/api/agent/program", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task }),
+      });
+      const result = await response.json().catch(() => ({})) as { detail?: string; label?: string; queued?: boolean };
+      if (!response.ok) throw new Error(result.detail ?? `HTTP ${response.status}`);
+      notify(`已调用程序：${result.label ?? "操作"}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "自然语言程序调用失败";
+      setProgramError(message);
+      console.error("[teleop] natural-language program request failed", error);
+    } finally {
+      setProgramSubmitting(false);
+    }
   };
 
   const runAgentTask = async () => {
@@ -608,10 +655,10 @@ function App() {
         <aside className="side left" aria-label="机械臂控制">
           <div className="side-head"><h2>关节控制</h2><span className="pill">deg</span></div>
           <div className="mode-switch" role="group" aria-label="控制模式">
-            <button className={mode === "cartesian" ? "active" : ""} type="button" onClick={() => selectMode("cartesian")}>末端控制</button>
-            <button className={mode === "joint" ? "active" : ""} type="button" onClick={() => selectMode("joint")}>关节控制</button>
+            <button className={mode === "cartesian" ? "active" : ""} type="button" onClick={() => selectMode("cartesian")} disabled={programBusy}>末端控制</button>
+            <button className={mode === "joint" ? "active" : ""} type="button" onClick={() => selectMode("joint")} disabled={programBusy}>关节控制</button>
           </div>
-          <div className="slider-row"><label htmlFor="speed">速度</label><input id="speed" type="range" min="0.02" max="0.35" step="0.01" value={speed} onChange={(event) => setSpeed(Number(event.target.value))} disabled={!enabled || collisionMode} /><output>{Math.round(speed / 0.35 * 100)}%</output></div>
+          <div className="slider-row"><label htmlFor="speed">速度</label><input id="speed" type="range" min="0.02" max="0.35" step="0.01" value={speed} onChange={(event) => setSpeed(Number(event.target.value))} disabled={!enabled || collisionMode || programBusy} /><output>{Math.round(speed / 0.35 * 100)}%</output></div>
           <div className="section-rule" />
           <div className={`joint-list ${mode === "joint" ? "joint-active" : ""}`} aria-label="七个关节目标角">
             {joints.map((value, index) => (
@@ -625,15 +672,15 @@ function App() {
                   value={value}
                   aria-label={`关节 J${index + 1} 目标位置`}
                   onChange={(event) => setJoint(index, Number(event.target.value))}
-                  disabled={!enabled || collisionMode || !!teleopState?.homing}
+                  disabled={!enabled || collisionMode || !!teleopState?.homing || programBusy}
                 />
                 <span className="joint-value">{(value * 180 / Math.PI).toFixed(1)}°</span>
               </div>
             ))}
           </div>
           <div className="section-rule" />
-          <div className="slider-row"><label htmlFor="gripper">夹爪</label><input id="gripper" type="range" min="0" max="0.04" step="0.001" value={gripper} onChange={(event) => setGripper(Number(event.target.value))} disabled={!enabled || collisionMode} /><output>{Math.round(gripper * 1000)} mm</output></div>
-          <div className="button-row"><button className="action-button" type="button" onClick={() => setGripper(0.04)} disabled={!enabled || collisionMode}>张开</button><button className="action-button" type="button" onClick={() => setGripper(0)} disabled={!enabled || collisionMode}>闭合</button></div>
+          <div className="slider-row"><label htmlFor="gripper">夹爪</label><input id="gripper" type="range" min="0" max="0.04" step="0.001" value={gripper} onChange={(event) => setGripper(Number(event.target.value))} disabled={!enabled || collisionMode || programBusy} /><output>{Math.round(gripper * 1000)} mm</output></div>
+          <div className="button-row"><button className="action-button" type="button" onClick={() => setGripper(0.04)} disabled={!enabled || collisionMode || programBusy}>张开</button><button className="action-button" type="button" onClick={() => setGripper(0)} disabled={!enabled || collisionMode || programBusy}>闭合</button></div>
         </aside>
 
         <section className={`stage ${frameLoaded ? "has-frame" : ""}`} aria-label="Genesis 仿真实时画面">
@@ -761,10 +808,20 @@ function App() {
             <div><span>夹爪开度</span><b>{teleopState ? `${Math.round(teleopState.gripper * 1000)} mm` : "—"}</b></div>
           </div>
           <div className="section-rule" />
-          <div className="side-head"><h2>VLM 视觉任务</h2><span className={`pill ${agentStatus?.configured ? "pill-live" : ""}`}>{agentStatus?.configured ? agentStatus.model : "未配置"}</span></div>
+          <div className="side-head"><h2>自然语言操作</h2><span className={`pill ${agentStatus?.configured ? "pill-live" : ""}`}>{agentStatus?.configured ? agentStatus.model : "程序模式"}</span></div>
           <div className="agent-panel">
-            <label htmlFor="agent-task">自然语言任务</label>
-            <textarea id="agent-task" value={agentTask} maxLength={500} onChange={(event) => setAgentTask(event.target.value)} placeholder="例如：把蓝色方块移动到托盘上" disabled={agentLoading || agentAutoRunning || !!teleopState?.agent_busy} />
+            <label htmlFor="agent-task">输入指令，例如“抓取蓝色方块并放到托盘”</label>
+            <textarea id="agent-task" value={agentTask} maxLength={500} onChange={(event) => setAgentTask(event.target.value)} placeholder="抓取蓝色方块并放到托盘" disabled={agentLoading || agentAutoRunning || programSubmitting || !!teleopState?.agent_busy} />
+            <button className="action-button primary" type="button" onClick={() => void runNaturalProgram()} disabled={!simulationReady || !enabled || collisionMode || !!keys.length || agentLoading || agentAutoRunning || programSubmitting || !!teleopState?.homing || !!teleopState?.agent_busy || !agentTask.trim()}>
+              {programSubmitting ? "正在调用程序…" : "自然语言调用程序"}
+            </button>
+            {teleopState?.program_status && teleopState.program_status.state !== "idle" && <div className="agent-plan" aria-live="polite">
+              <strong>{teleopState.program_status.label} · {teleopState.program_status.state === "queued" ? "排队中" : teleopState.program_status.state === "running" ? "执行中" : teleopState.program_status.state === "completed" ? "已完成" : teleopState.program_status.state === "stopped" ? "已停止" : "未完成"}</strong>
+              <span>{teleopState.program_status.message}{teleopState.program_status.state === "running" && teleopState.program_status.total > 0 ? `（${teleopState.program_status.step}/${teleopState.program_status.total}）` : ""}</span>
+              {(["queued", "running"] as const).includes(teleopState.program_status.state as "queued" | "running") && <button className="action-button agent-stop-button" type="button" onClick={() => void stopAgentTask()}>停止程序</button>}
+            </div>}
+            {programError && <div className="recording-error" role="status">操作：{programError}</div>}
+            <small className="agent-footnote">内置程序支持抓取蓝/绿方块、放入托盘、松开夹爪、回到初始姿态和重置场景。程序逐段移动并持续检查工作范围与碰撞保护。</small>
             <div className="button-row agent-controls">
               <button className="action-button" type="button" onClick={() => void analyzeAgentTask()} disabled={!agentStatus?.configured || !simulationReady || agentLoading || agentAutoRunning || !!keys.length || !!teleopState?.agent_busy || !agentTask.trim()}>
                 {agentLoading ? "正在看图与分析…" : "分析并建议一步"}
@@ -829,7 +886,7 @@ function App() {
           </div>
           <div className="dock-cell speed-cell">
             <div className="dock-title">末端速度</div>
-            <div className="slider-row"><label htmlFor="dock-speed">线速度</label><input id="dock-speed" type="range" min="0.02" max="0.35" step="0.01" value={speed} onChange={(event) => setSpeed(Number(event.target.value))} /><output>{speed.toFixed(2)} m/s</output></div>
+            <div className="slider-row"><label htmlFor="dock-speed">线速度</label><input id="dock-speed" type="range" min="0.02" max="0.35" step="0.01" value={speed} onChange={(event) => setSpeed(Number(event.target.value))} disabled={programBusy} /><output>{speed.toFixed(2)} m/s</output></div>
             <div className="dock-state"><span>当前末端</span><b>{teleopState?.ee?.map((v) => round(v, 3)).join(", ") ?? "—"}</b></div>
             <div className="dock-state"><span>关节模式</span><b>J1—J7</b></div>
           </div>
@@ -837,7 +894,7 @@ function App() {
             <div className="dock-title">工作状态</div>
             <div className={`connection ${online && !simulationError ? "" : "offline"}`}><i className="live-dot" /><strong>{simulationError ? "仿真异常" : simulationReady ? "仿真运行中" : online ? "场景初始化中" : "等待仿真连接"}</strong></div>
             <div className="help-text">{simulationError || "Franka Panda 由本地 Genesis 仿真执行控制。"}</div>
-            <div className="button-row"><button className="action-button" type="button" onClick={() => action("home")} disabled={!enabled || !!teleopState?.homing || collisionMode}>{teleopState?.homing ? "平滑回零中…" : "回到初始姿态"}</button><button className="action-button" type="button" onClick={toggleControl} disabled={collisionMode}>{enabled ? "停止控制" : "恢复控制"}</button></div>
+            <div className="button-row"><button className="action-button" type="button" onClick={() => action("home")} disabled={!enabled || !!teleopState?.homing || collisionMode || programBusy}>{teleopState?.homing ? "平滑回零中…" : "回到初始姿态"}</button><button className="action-button" type="button" onClick={toggleControl} disabled={collisionMode}>{enabled ? "停止控制" : "恢复控制"}</button></div>
           </div>
         </section>
       </main>

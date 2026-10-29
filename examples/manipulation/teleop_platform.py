@@ -54,9 +54,11 @@ from pydantic import BaseModel, Field
 import uvicorn
 if __package__:
     from .teleop_recording import create_recording_session
+    from .teleop_skills import PROGRAMS, interpret_natural_program
     from .teleop_validation import validate_agent_plan, validate_move_delta
 else:
     from teleop_recording import create_recording_session
+    from teleop_skills import PROGRAMS, interpret_natural_program
     from teleop_validation import validate_agent_plan, validate_move_delta
 import genesis as gs
 from genesis.utils.geom import inv_T, pos_lookat_up_to_T, trans_quat_to_T, transform_quat_by_quat
@@ -226,6 +228,9 @@ class FrankaTeleopPlatform:
         self._control_enabled = True
         self._agent_trajectory = None
         self._agent_gripper_target = None
+        self._agent_move_failed = False
+        self._program_task = None
+        self._program_status = {"program": "", "label": "", "state": "idle", "step": 0, "total": 0, "message": ""}
         camera_offset = CAMERA_POS - CAMERA_LOOKAT
         self._camera_target = CAMERA_LOOKAT.copy()
         self._camera_distance = float(np.linalg.norm(camera_offset))
@@ -459,6 +464,7 @@ class FrankaTeleopPlatform:
                 "started_at": float(self.scene.t) * float(self.scene.dt),
                 "duration": AGENT_MOVE_DURATION_S,
             }
+            self._agent_move_failed = False
             self._home_trajectory = None
             LOGGER.info("VLM Cartesian step started: delta_m=%s duration=%.2fs", delta.round(4).tolist(), AGENT_MOVE_DURATION_S)
         elif action == "agent_gripper":
@@ -474,8 +480,206 @@ class FrankaTeleopPlatform:
         elif action == "agent_stop":
             self._agent_trajectory = None
             self._agent_gripper_target = None
+            if self._program_status.get("program") == "home":
+                self._home_trajectory = None
             self._sync_target()
+            if self._program_task is not None or self._program_status.get("state") in ("queued", "running"):
+                self._finish_program("stopped", "已由操作员停止")
             LOGGER.info("VLM task stopped by operator")
+        elif action == "agent_program":
+            try:
+                self._start_program(params or {})
+            except Exception as exc:
+                LOGGER.exception("natural-language program setup failed: %s", exc)
+                self._program_status = {
+                    "program": (params or {}).get("program", ""),
+                    "label": (params or {}).get("label", "操作程序"),
+                    "state": "failed",
+                    "step": 0,
+                    "total": 0,
+                    "message": f"程序准备失败：{type(exc).__name__}",
+                }
+
+    def _program_move_steps(self, target, label):
+        destination = np.asarray(target, dtype=np.float64)
+        start = np.asarray(getattr(self, "_program_planning_position", self._target_pos), dtype=np.float64).copy()
+        distance = float(np.linalg.norm(destination - start))
+        segments = max(1, int(math.ceil(distance / 0.16)))
+        steps = []
+        for index in range(1, segments + 1):
+            waypoint = start + (destination - start) * (index / segments)
+            bounded, clamped = self._clamp_target(waypoint)
+            if bounded is None or clamped:
+                raise ValueError(f"{label}超出机械臂安全工作范围")
+            segment_distance = float(np.linalg.norm(waypoint - (start if index == 1 else steps[-1]["target"])))
+            steps.append({
+                "kind": "move",
+                "target": waypoint,
+                "duration": max(0.75, segment_distance / 0.16 * 1.6),
+                "label": label,
+            })
+        self._program_planning_position = destination.copy()
+        return steps
+
+    def _start_program(self, params):
+        if self._collision_mode or self._home_trajectory is not None or not self._command.enabled:
+            self._program_status = {**self._program_status, "state": "failed", "message": "碰撞保护、回零或控制停止期间不能运行程序"}
+            return
+        program = params.get("program")
+        color = params.get("object_color")
+        label = params.get("label", PROGRAMS.get(program, {}).get("label", program or ""))
+        if program == "home":
+            self._program_status = {"program": program, "label": label, "state": "running", "step": 1, "total": 1, "message": "平滑回到初始姿态"}
+            self._apply_action("home")
+            return
+        if program == "reset_scene":
+            self._apply_action("reset_scene")
+            self._program_status = {"program": program, "label": label, "state": "completed", "step": 1, "total": 1, "message": "场景物体已复位"}
+            return
+
+        steps = []
+        self._program_planning_position = self._target_pos.copy()
+        if program in ("pick", "pick_place_tray"):
+            object_candidates = [
+                (index, cube, color_name)
+                for index, (cube, color_name) in enumerate(zip(self.cubes, ("blue", "green")))
+                if color is None or color == color_name
+            ]
+            if not object_candidates:
+                self._program_status = {"program": program, "label": label, "state": "failed", "step": 0, "total": 0, "message": "找不到指定颜色的方块"}
+                return
+            _, cube, color_name = min(
+                object_candidates,
+                key=lambda item: float(np.linalg.norm(tensor_to_array(item[1].get_pos(relative=False))[:2] - self._target_pos[:2])),
+            )
+            object_position = tensor_to_array(cube.get_pos(relative=False)).astype(np.float64)
+            grasp_z = max(float(object_position[2]) + 0.11, 0.12)
+            approach = np.array([object_position[0], object_position[1], grasp_z + 0.14], dtype=np.float64)
+            grasp = np.array([object_position[0], object_position[1], grasp_z], dtype=np.float64)
+            lift = grasp + np.array([0.0, 0.0, 0.16])
+            steps.append({"kind": "gripper", "target": GRIPPER_OPEN, "label": "打开夹爪"})
+            steps.extend(self._program_move_steps(approach, f"移动到{color_name}方块上方"))
+            steps.extend(self._program_move_steps(grasp, "下降到抓取位置"))
+            steps.append({"kind": "gripper", "target": 0.0, "label": "夹住方块"})
+            steps.append({"kind": "wait", "duration": 0.25, "label": "确认夹持"})
+            steps.extend(self._program_move_steps(lift, "抬起方块"))
+            if program == "pick_place_tray":
+                tray_position = tensor_to_array(self.tray.get_pos(relative=False)).astype(np.float64)
+                tray_hover = np.array([tray_position[0], tray_position[1], 0.34], dtype=np.float64)
+                tray_drop = np.array([tray_position[0], tray_position[1], max(float(tray_position[2]) + 0.17, 0.17)], dtype=np.float64)
+                steps.extend(self._program_move_steps(tray_hover, "移动到托盘上方"))
+                steps.extend(self._program_move_steps(tray_drop, "下降到托盘"))
+                steps.append({"kind": "gripper", "target": GRIPPER_OPEN, "label": "放开方块"})
+                steps.append({"kind": "wait", "duration": 0.3, "label": "等待方块落稳"})
+                steps.extend(self._program_move_steps(tray_hover, "抬离托盘"))
+        elif program == "place_held_tray":
+            tray_position = tensor_to_array(self.tray.get_pos(relative=False)).astype(np.float64)
+            tray_hover = np.array([tray_position[0], tray_position[1], 0.34], dtype=np.float64)
+            tray_drop = np.array([tray_position[0], tray_position[1], max(float(tray_position[2]) + 0.17, 0.17)], dtype=np.float64)
+            steps.extend(self._program_move_steps(tray_hover, "移动到托盘上方"))
+            steps.extend(self._program_move_steps(tray_drop, "下降到托盘"))
+            steps.append({"kind": "gripper", "target": GRIPPER_OPEN, "label": "放开物体"})
+            steps.append({"kind": "wait", "duration": 0.3, "label": "等待物体落稳"})
+            steps.extend(self._program_move_steps(tray_hover, "抬离托盘"))
+        elif program in ("release", "close_gripper"):
+            steps.append({"kind": "gripper", "target": GRIPPER_OPEN if program == "release" else 0.0, "label": label})
+        else:
+            self._program_status = {"program": program or "", "label": label, "state": "failed", "step": 0, "total": 0, "message": "未知的内置程序"}
+            return
+
+        self._program_task = {"program": program, "label": label, "steps": steps, "index": 0, "phase": "starting"}
+        self._program_status = {"program": program, "label": label, "state": "running", "step": 0, "total": len(steps), "message": "准备执行"}
+        LOGGER.info("natural-language program started: program=%s color=%s steps=%d", program, color_name if program in ("pick", "pick_place_tray") else "", len(steps))
+        self._start_program_step()
+
+    def _start_program_step(self):
+        task = self._program_task
+        if task is None:
+            return
+        if task["index"] >= len(task["steps"]):
+            self._finish_program("completed", "操作程序已完成")
+            return
+        step = task["steps"][task["index"]]
+        self._program_status = {
+            "program": task["program"],
+            "label": task["label"],
+            "state": "running",
+            "step": task["index"] + 1,
+            "total": len(task["steps"]),
+            "message": step["label"],
+        }
+        if step["kind"] == "move":
+            self._agent_move_failed = False
+            self._agent_trajectory = {
+                "start": self._target_pos.copy(),
+                "target": np.asarray(step["target"], dtype=np.float64).copy(),
+                "started_at": float(self.scene.t) * float(self.scene.dt),
+                "duration": step["duration"],
+            }
+            task["phase"] = "move"
+        elif step["kind"] == "gripper":
+            self._agent_gripper_target = float(step["target"])
+            task["phase"] = "gripper"
+        else:
+            task["phase"] = "wait"
+            task["started_at"] = float(self.scene.t) * float(self.scene.dt)
+
+    def _finish_program(self, state, message):
+        task = self._program_task
+        if task is not None:
+            self._program_status = {
+                "program": task["program"],
+                "label": task["label"],
+                "state": state,
+                "step": self._program_status.get("step", 0),
+                "total": len(task["steps"]),
+                "message": message,
+            }
+        elif self._program_status.get("state") in ("queued", "running"):
+            self._program_status = {**self._program_status, "state": state, "message": message}
+        self._program_task = None
+        self._agent_trajectory = None
+        self._agent_gripper_target = None
+        LOGGER.info("natural-language program %s: %s", state, message)
+
+    def _advance_program_step(self):
+        if self._program_task is None:
+            return
+        self._program_task["index"] += 1
+        self._start_program_step()
+
+    def _advance_program_command(self):
+        task = self._program_task
+        if task is None:
+            return
+        if task["phase"] == "move":
+            self._advance_agent_trajectory()
+            if self._agent_move_failed:
+                self._finish_program("failed", "目标不可达或动作超出工作范围，程序已停止")
+            elif self._agent_trajectory is None:
+                self._advance_program_step()
+            return
+        if task["phase"] == "gripper":
+            target = self._agent_gripper_target
+            if target is None:
+                self._advance_program_step()
+                return
+            self._gripper = float(np.clip(self._gripper + np.clip(target - self._gripper, -0.002, 0.002), 0.0, GRIPPER_OPEN))
+            self._last_action_joints = self._joint_positions()[:7].copy()
+            self._last_action_gripper = self._gripper
+            self.franka.control_dofs_position(np.array([self._gripper, self._gripper]), FINGER_DOF_IDX)
+            for _ in range(2):
+                self.scene.step()
+            if abs(self._gripper - target) < 0.001:
+                self._agent_gripper_target = None
+                self._advance_program_step()
+            return
+        self.franka.control_dofs_position(np.array([self._gripper, self._gripper]), FINGER_DOF_IDX)
+        for _ in range(2):
+            self.scene.step()
+        sim_time = float(self.scene.t) * float(self.scene.dt)
+        if sim_time - task["started_at"] >= task["steps"][task["index"]]["duration"]:
+            self._advance_program_step()
 
     def _advance_agent_trajectory(self):
         trajectory = self._agent_trajectory
@@ -490,6 +694,7 @@ class FrankaTeleopPlatform:
         if target is None or clamped:
             LOGGER.warning("VLM motion stopped at workspace boundary: target=%s", candidate.round(4).tolist())
             self._agent_trajectory = None
+            self._agent_move_failed = True
             self._sync_target()
             return False
         previous_target = self._target_pos.copy()
@@ -505,6 +710,7 @@ class FrankaTeleopPlatform:
         if np.linalg.norm(tensor_to_array(err)[:3]) > 0.012:
             LOGGER.warning("VLM motion stopped: IK error exceeded 12 mm at target=%s", target.round(4).tolist())
             self._agent_trajectory = None
+            self._agent_move_failed = True
             self._target_pos = previous_target
         else:
             self._target_pos = target
@@ -548,6 +754,8 @@ class FrankaTeleopPlatform:
             self._gripper = GRIPPER_OPEN
             self._sync_target()
             LOGGER.info("smooth home trajectory completed")
+            if self._program_status.get("program") == "home" and self._program_status.get("state") == "running":
+                self._program_status = {**self._program_status, "state": "completed", "step": 1, "message": "已回到初始姿态"}
         return True
 
     def _step_zero_force_mode(self):
@@ -565,6 +773,8 @@ class FrankaTeleopPlatform:
         self._agent_trajectory = None
         self._agent_gripper_target = None
         self._home_trajectory = None
+        if self._program_task is not None or self._program_status.get("state") in ("queued", "running"):
+            self._finish_program("failed", "碰撞保护已触发，操作程序已停止")
         self._collision_force_n = float(force_n)
         self._collision_position = np.asarray(position, dtype=np.float64).round(4).tolist()
         self._collision_link = link_name
@@ -592,15 +802,29 @@ class FrankaTeleopPlatform:
         magnitudes = np.maximum(np.linalg.norm(force_a, axis=1), np.linalg.norm(force_b, axis=1))
         if magnitudes.size == 0:
             return
+        geom_a = tensor_to_array(contacts["geom_a"]).reshape(-1)
+        geom_b = tensor_to_array(contacts["geom_b"]).reshape(-1)
+        link_a = tensor_to_array(contacts["link_a"]).reshape(-1)
+        link_b = tensor_to_array(contacts["link_b"]).reshape(-1)
+        if self._program_task is not None and self._program_task.get("phase") == "gripper":
+            movable_geometry_ranges = [(cube.geom_start, cube.geom_end) for cube in self.cubes]
+            movable_geometry_ranges.append((self.tray.geom_start, self.tray.geom_end))
+            for index in range(min(len(magnitudes), len(geom_a), len(geom_b), len(link_a), len(link_b))):
+                try:
+                    robot_contact = self.franka.geom_start <= geom_a[index] < self.franka.geom_end
+                    link_index = link_a[index] if robot_contact else link_b[index]
+                    other_geom = geom_b[index] if robot_contact else geom_a[index]
+                    link_name = getattr(self.scene.rigid_solver.links[int(link_index)], "name", "")
+                except (IndexError, TypeError, ValueError):
+                    continue
+                touches_program_object = any(start <= other_geom < end for start, end in movable_geometry_ranges)
+                if link_name in ("left_finger", "right_finger") and touches_program_object:
+                    magnitudes[index] = 0.0
         contact_index = int(np.argmax(magnitudes))
         force_n = float(magnitudes[contact_index])
         if force_n < COLLISION_FORCE_THRESHOLD_N:
             return
         positions = tensor_to_array(contacts["position"]).reshape((-1, 3))
-        geom_a = tensor_to_array(contacts["geom_a"]).reshape(-1)
-        geom_b = tensor_to_array(contacts["geom_b"]).reshape(-1)
-        link_a = tensor_to_array(contacts["link_a"]).reshape(-1)
-        link_b = tensor_to_array(contacts["link_b"]).reshape(-1)
         link_name = ""
         if contact_index < len(geom_a) and contact_index < len(geom_b):
             try:
@@ -648,7 +872,7 @@ class FrankaTeleopPlatform:
         if command.action:
             # Recording and object reset remain available while paused. Robot motion actions
             # such as homing are accepted only when control is enabled.
-            if command.action in ("toggle_recording", "reset_scene", "recording_start", "recording_stop", "agent_stop") or command.enabled:
+            if command.action in ("toggle_recording", "reset_scene", "recording_start", "recording_stop", "agent_stop", "agent_program") or command.enabled:
                 self._apply_action(command.action, command.action_params)
 
         if self._collision_mode:
@@ -663,6 +887,8 @@ class FrankaTeleopPlatform:
             self._home_trajectory = None
             self._agent_trajectory = None
             self._agent_gripper_target = None
+            if self._program_task is not None or self._program_status.get("state") in ("queued", "running"):
+                self._finish_program("stopped", "控制已停止或连接中断")
             if self._control_enabled:
                 # Capture the current pose once and hold it, so Stop doesn't keep integrating
                 # an old key or slider target.
@@ -679,6 +905,14 @@ class FrankaTeleopPlatform:
             return
 
         self._control_enabled = True
+
+        if self._program_task is not None:
+            if command.keys:
+                self._finish_program("stopped", "收到人工移动输入，程序已交还控制权")
+                self._sync_target()
+            else:
+                self._advance_program_command()
+                return
 
         if self._agent_trajectory is not None and command.keys:
             LOGGER.info("VLM Cartesian step interrupted by direct teleoperation input")
@@ -1019,7 +1253,12 @@ class FrankaTeleopPlatform:
                 {"name": "green cube", "color": "green", "position": tensor_to_array(self.cubes[1].get_pos(relative=False)).round(4).tolist()},
                 {"name": "gray tray", "color": "gray", "position": tensor_to_array(self.tray.get_pos(relative=False)).round(4).tolist()},
             ],
-            "agent_busy": self._agent_trajectory is not None or self._agent_gripper_target is not None,
+            "agent_busy": (
+                self._agent_trajectory is not None
+                or self._agent_gripper_target is not None
+                or self._program_status.get("state") in ("queued", "running")
+            ),
+            "program_status": dict(self._program_status),
         }
         with self._lock:
             self._state = state
@@ -1075,6 +1314,35 @@ class FrankaTeleopPlatform:
         with self._lock:
             self._pending_actions.append(("agent_stop", None))
         LOGGER.info("VLM task stop requested by operator")
+
+    def queue_natural_program(self, text):
+        request = interpret_natural_program(text)
+        with self._lock:
+            state = self._state
+            if not state.get("ee"):
+                raise ValueError("Genesis 仿真尚未就绪")
+            if state.get("collision_mode"):
+                raise ValueError("碰撞保护生效时不能执行操作程序")
+            if state.get("homing"):
+                raise ValueError("机械臂正在回到初始姿态")
+            if not self._command.enabled or time.monotonic() - self._last_command_time > 0.7:
+                raise ValueError("请先连接工作台并恢复机械臂控制")
+            if self._command.mode == "joint":
+                raise ValueError("自然语言操作需要先切换到末端控制模式")
+            pending_program = any(action == "agent_program" for action, _ in self._pending_actions)
+            if state.get("agent_busy") or pending_program:
+                raise ValueError("当前已有动作或程序正在执行")
+            self._program_status = {
+                "program": request["program"],
+                "label": request["label"],
+                "state": "queued",
+                "step": 0,
+                "total": 0,
+                "message": "已匹配内置程序，等待仿真执行",
+            }
+            self._pending_actions.append(("agent_program", request))
+        LOGGER.info("natural-language request matched built-in program: request=%r match=%s", text, request)
+        return request
 
     def set_sensor_mode(self, mode: str):
         with self._lock:
@@ -1382,6 +1650,7 @@ def create_app(platform: FrankaTeleopPlatform) -> FastAPI:
                 "recording_formats": recording_formats,
                 "embodied_agent": True,
                 "closed_loop_agent": True,
+                "natural_programs": True,
                 "vlm_configured": bool(VLM_MODEL),
             },
         }
@@ -1403,6 +1672,18 @@ def create_app(platform: FrankaTeleopPlatform) -> FastAPI:
             "endpoint": VLM_URL if VLM_MODEL else "",
             "max_move_m": AGENT_MOVE_MAX_M,
         }
+
+    @app.get("/api/agent/programs")
+    async def agent_programs():
+        return {"programs": PROGRAMS, "execution": "local_whitelist"}
+
+    @app.post("/api/agent/program")
+    async def agent_program(payload: AgentAnalyzePayload):
+        try:
+            request = platform.queue_natural_program(payload.task)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "queued": True, **request}
 
     @app.post("/api/agent/analyze")
     async def agent_analyze(payload: AgentAnalyzePayload):
