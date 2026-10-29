@@ -6,6 +6,7 @@ imgui.ini
 .DS_Store
 sftp-config.json
 *.mp4
+!examples/teleop/assets/teleop-demo.mp4
 genesis/assets/terrain/
 
 # Byte-compiled / optimized / DLL files
