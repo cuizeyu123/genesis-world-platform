@@ -361,7 +361,7 @@ class FrankaTeleopPlatform:
             res=FIRST_PERSON_RES,
             pos=CAMERA_POS,
             lookat=CAMERA_LOOKAT,
-            fov=78.0,
+            fov=88.0,
             GUI=False,
             near=0.03,
             far=8.0,
@@ -372,10 +372,14 @@ class FrankaTeleopPlatform:
         self._setup_robot()
         hand_pos = tensor_to_array(self.hand.get_pos(relative=False)).astype(np.float64)
         hand_quat = tensor_to_array(self.hand.get_quat(relative=False)).astype(np.float64)
-        view_direction = np.array([0.52, 0.0, -0.42], dtype=np.float64)
+        first_person_pos = hand_pos + np.array([0.0, -0.075, 0.035], dtype=np.float64)
+        object_positions = np.asarray(
+            [tensor_to_array(cube.get_pos(relative=False)).astype(np.float64) for cube in self.cubes]
+        )
+        first_person_lookat = object_positions.mean(axis=0)
+        view_direction = first_person_lookat - first_person_pos
         view_direction /= np.linalg.norm(view_direction)
-        first_person_pos = hand_pos + view_direction * 0.045
-        first_person_lookat = first_person_pos + view_direction * 0.85
+        first_person_lookat = first_person_pos + view_direction * 1.25
         hand_transform = trans_quat_to_T(hand_pos, hand_quat)
         camera_transform = pos_lookat_up_to_T(
             first_person_pos,

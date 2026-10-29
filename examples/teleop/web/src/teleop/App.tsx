@@ -813,7 +813,7 @@ function App() {
             <label htmlFor="agent-task">输入指令，例如“抓取蓝色方块并放到托盘”</label>
             <textarea id="agent-task" value={agentTask} maxLength={500} onChange={(event) => setAgentTask(event.target.value)} placeholder="抓取蓝色方块并放到托盘" disabled={agentLoading || agentAutoRunning || programSubmitting || !!teleopState?.agent_busy} />
             <button className="action-button primary" type="button" onClick={() => void runNaturalProgram()} disabled={!simulationReady || !enabled || collisionMode || !!keys.length || agentLoading || agentAutoRunning || programSubmitting || !!teleopState?.homing || !!teleopState?.agent_busy || !agentTask.trim()}>
-              {programSubmitting ? "正在调用程序…" : "自然语言调用程序"}
+              {programSubmitting ? "正在执行…" : "执行指令"}
             </button>
             {teleopState?.program_status && teleopState.program_status.state !== "idle" && <div className="agent-plan" aria-live="polite">
               <strong>{teleopState.program_status.label} · {teleopState.program_status.state === "queued" ? "排队中" : teleopState.program_status.state === "running" ? "执行中" : teleopState.program_status.state === "completed" ? "已完成" : teleopState.program_status.state === "stopped" ? "已停止" : "未完成"}</strong>
